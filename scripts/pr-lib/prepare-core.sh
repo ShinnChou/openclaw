@@ -146,6 +146,7 @@ prepare_push() {
 
   local prep_head_sha
   prep_head_sha=$(git rev-parse HEAD)
+  local local_prep_head_sha
 
   local lease_sha
   lease_sha=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
@@ -155,7 +156,17 @@ prepare_push() {
   push_prep_head_to_pr_branch "$pr" "$PR_HEAD" "$prep_head_sha" "$lease_sha" true "${DOCS_ONLY:-false}" "$push_result_env"
   # shellcheck disable=SC1090
   source "$push_result_env"
+  # A lease retry reruns gates for the rebased head and rewrites gates.env;
+  # re-source so prep.md/prep.env carry the stamp for the head actually pushed.
+  # shellcheck disable=SC1091
+  source .local/gates.env
   prep_head_sha="$PUSH_PREP_HEAD_SHA"
+  local_prep_head_sha="$PUSH_LOCAL_PREP_HEAD_SHA"
+  local mainline_base_sha
+  mainline_base_sha=$(git merge-base "$local_prep_head_sha" origin/main) || {
+    echo "Unable to resolve the prepared mainline base."
+    exit 1
+  }
   local pushed_from_sha="$PUSHED_FROM_SHA"
   local pr_head_sha_after="$PR_HEAD_SHA_AFTER_PUSH"
 
@@ -163,30 +174,41 @@ prepare_push() {
   if [ -z "$contrib" ]; then
     contrib=$(gh pr view "$pr" --json author --jq .author.login)
   fi
-  local contrib_id
-  contrib_id=$(gh api "users/$contrib" --jq .id)
-  local coauthor_email="${contrib_id}+${contrib}@users.noreply.github.com"
+  local coauthor_email=""
+  if coauthor_email=$(resolve_contributor_coauthor_email "$contrib"); then
+    :
+  else
+    coauthor_email=""
+  fi
 
   cat >> .local/prep.md <<EOF_PREP
 - Gates passed and push succeeded to branch $PR_HEAD.
 - Gate mode: ${GATES_MODE:-unknown}.
-- Verified PR head SHA matches local prep HEAD.
-- Verified PR head contains origin/main.
+- Verified the remote PR head tree matches the local prep head.
 EOF_PREP
+  if [ -n "${REMOTE_GATES_LEASE_ID:-}" ]; then
+    cat >> .local/prep.md <<EOF_PREP
+- Remote testbox gate stamp: ${REMOTE_GATES_LEASE_ID}${REMOTE_GATES_RUN_URL:+ (${REMOTE_GATES_RUN_URL})}.
+EOF_PREP
+  fi
 
   # Security: shell-escape values to prevent command injection via propagated PR_HEAD.
   printf '%s=%q\n' \
     PR_NUMBER "$PR_NUMBER" \
     PR_AUTHOR "$contrib" \
+    PR_URL "${PR_URL:-}" \
     PR_HEAD "$PR_HEAD" \
     PR_HEAD_SHA_BEFORE "$pushed_from_sha" \
     PREP_HEAD_SHA "$prep_head_sha" \
+    LOCAL_PREP_HEAD_SHA "$local_prep_head_sha" \
+    PREP_MAINLINE_BASE_SHA "$mainline_base_sha" \
     COAUTHOR_EMAIL "$coauthor_email" \
     > .local/prep.env
 
   ls -la .local/prep.md .local/prep.env >/dev/null
 
   echo "prepare-push complete"
+  echo "pr_url=${PR_URL:-}"
   echo "prep_branch=$(git branch --show-current)"
   echo "prep_head_sha=$prep_head_sha"
   echo "pr_head_sha=$pr_head_sha_after"
@@ -207,20 +229,17 @@ prepare_sync_head() {
   # shellcheck disable=SC1091
   source .local/prep-context.env
 
-  local rebased=false
+  # merge-verify owns relevance-aware mainline drift. Keep the hosted PR head
+  # as the publication parent so fork updates contain only reviewed fixups.
   git fetch origin main
-  if ! git merge-base --is-ancestor origin/main HEAD; then
-    git rebase origin/main
-    rebased=true
-    prepare_gates "$pr"
-    checkout_prep_branch "$pr"
-  fi
 
   local prep_head_sha
   prep_head_sha=$(git rev-parse HEAD)
+  local local_prep_head_sha
 
   local lease_sha
   lease_sha=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
+  verify_prep_head_extends_hosted_head "$lease_sha" || exit 1
   local push_result_env=".local/prepare-sync-result.env"
 
   verify_pr_head_branch_matches_expected "$pr" "$PR_HEAD"
@@ -228,6 +247,12 @@ prepare_sync_head() {
   # shellcheck disable=SC1090
   source "$push_result_env"
   prep_head_sha="$PUSH_PREP_HEAD_SHA"
+  local_prep_head_sha="$PUSH_LOCAL_PREP_HEAD_SHA"
+  local mainline_base_sha
+  mainline_base_sha=$(git merge-base "$local_prep_head_sha" origin/main) || {
+    echo "Unable to resolve the prepared mainline base."
+    exit 1
+  }
   local pushed_from_sha="$PUSHED_FROM_SHA"
   local pr_head_sha_after="$PR_HEAD_SHA_AFTER_PUSH"
 
@@ -235,31 +260,36 @@ prepare_sync_head() {
   if [ -z "$contrib" ]; then
     contrib=$(gh pr view "$pr" --json author --jq .author.login)
   fi
-  local contrib_id
-  contrib_id=$(gh api "users/$contrib" --jq .id)
-  local coauthor_email="${contrib_id}+${contrib}@users.noreply.github.com"
+  local coauthor_email=""
+  if coauthor_email=$(resolve_contributor_coauthor_email "$contrib"); then
+    :
+  else
+    coauthor_email=""
+  fi
 
   cat >> .local/prep.md <<EOF_PREP
 - Prep head sync completed to branch $PR_HEAD.
-- Rebased onto origin/main: $rebased.
-- Verified PR head SHA matches local prep HEAD.
-- Verified PR head contains origin/main.
-- Prepare gates reran automatically when the sync rebase changed the prep head.
+- Preserved hosted PR ancestry; merge verification owns mainline drift.
+- Verified the remote PR head tree matches the local prep head.
 EOF_PREP
 
   # Security: shell-escape values to prevent command injection via propagated PR_HEAD.
   printf '%s=%q\n' \
     PR_NUMBER "$PR_NUMBER" \
     PR_AUTHOR "$contrib" \
+    PR_URL "${PR_URL:-}" \
     PR_HEAD "$PR_HEAD" \
     PR_HEAD_SHA_BEFORE "$pushed_from_sha" \
     PREP_HEAD_SHA "$prep_head_sha" \
+    LOCAL_PREP_HEAD_SHA "$local_prep_head_sha" \
+    PREP_MAINLINE_BASE_SHA "$mainline_base_sha" \
     COAUTHOR_EMAIL "$coauthor_email" \
     > .local/prep.env
 
   ls -la .local/prep.md .local/prep.env >/dev/null
 
   echo "prepare-sync-head complete"
+  echo "pr_url=${PR_URL:-}"
   echo "prep_branch=$(git branch --show-current)"
   echo "prep_head_sha=$prep_head_sha"
   echo "pr_head_sha=$pr_head_sha_after"
@@ -272,4 +302,5 @@ prepare_run() {
   prepare_gates "$pr"
   prepare_push "$pr"
   echo "prepare-run complete for PR #$pr"
+  echo "pr_url=${PR_URL:-}"
 }

@@ -1,26 +1,41 @@
-import { describe, expect, it, vi } from "vitest";
+// Mattermost tests cover monitor websocket plugin behavior.
+import { once } from "node:events";
+import { expectDefined } from "@openclaw/normalization-core";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { WebSocketServer } from "ws";
 import type { RuntimeEnv } from "../../runtime-api.js";
 import {
   createMattermostConnectOnce,
-  type MattermostWebSocketLike,
-  WebSocketClosedBeforeOpenError,
+  type MattermostWebSocketFactory,
 } from "./monitor-websocket.js";
-import { runWithReconnect } from "./reconnect.js";
 
-class FakeWebSocket implements MattermostWebSocketLike {
+function countMatching<T>(items: readonly T[], predicate: (item: T) => boolean): number {
+  let count = 0;
+  for (const item of items) {
+    if (predicate(item)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+class FakeWebSocket implements ReturnType<MattermostWebSocketFactory> {
   public readonly sent: string[] = [];
+  public pingCalls = 0;
   public closeCalls = 0;
   public terminateCalls = 0;
   private openListeners: Array<() => void> = [];
   private messageListeners: Array<(data: Buffer) => void | Promise<void>> = [];
+  private pongListeners: Array<(data: Buffer) => void> = [];
   private closeListeners: Array<(code: number, reason: Buffer) => void> = [];
   private errorListeners: Array<(err: unknown) => void> = [];
 
   on(event: "open", listener: () => void): void;
   on(event: "message", listener: (data: Buffer) => void | Promise<void>): void;
+  on(event: "pong", listener: (data: Buffer) => void): void;
   on(event: "close", listener: (code: number, reason: Buffer) => void): void;
   on(event: "error", listener: (err: unknown) => void): void;
-  on(event: "open" | "message" | "close" | "error", listener: unknown): void {
+  on(event: "open" | "message" | "pong" | "close" | "error", listener: unknown): void {
     if (event === "open") {
       this.openListeners.push(listener as () => void);
       return;
@@ -29,11 +44,19 @@ class FakeWebSocket implements MattermostWebSocketLike {
       this.messageListeners.push(listener as (data: Buffer) => void | Promise<void>);
       return;
     }
+    if (event === "pong") {
+      this.pongListeners.push(listener as (data: Buffer) => void);
+      return;
+    }
     if (event === "close") {
       this.closeListeners.push(listener as (code: number, reason: Buffer) => void);
       return;
     }
     this.errorListeners.push(listener as (err: unknown) => void);
+  }
+
+  ping(): void {
+    this.pingCalls++;
   }
 
   send(data: string): void {
@@ -57,6 +80,12 @@ class FakeWebSocket implements MattermostWebSocketLike {
   emitMessage(data: Buffer): void {
     for (const listener of this.messageListeners) {
       void listener(data);
+    }
+  }
+
+  emitPong(data = Buffer.alloc(0)): void {
+    for (const listener of this.pongListeners) {
+      listener(data);
     }
   }
 
@@ -84,6 +113,10 @@ const testRuntime = (): RuntimeEnv =>
   }) as RuntimeEnv;
 
 describe("mattermost websocket monitor", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+  });
+
   it("rejects when websocket closes before open", async () => {
     const socket = new FakeWebSocket();
     const connectOnce = createMattermostConnectOnce({
@@ -99,20 +132,23 @@ describe("mattermost websocket monitor", () => {
       socket.emitClose(1006, "connection refused");
     });
 
-    const failure = connectOnce();
-    await expect(failure).rejects.toBeInstanceOf(WebSocketClosedBeforeOpenError);
-    await expect(failure).rejects.toMatchObject({
-      message: "websocket closed before open (code 1006)",
+    let failure: unknown;
+    try {
+      await connectOnce();
+    } catch (caught) {
+      failure = caught;
+    }
+    expect(failure).toMatchObject({
+      name: "WebSocketClosedBeforeOpenError",
+      code: 1006,
+      reason: "connection refused",
     });
+    expect((failure as Error).message).toBe("websocket closed before open (code 1006)");
   });
 
   it("retries when first attempt errors before open and next attempt succeeds", async () => {
-    const abort = new AbortController();
-    const reconnectDelays: number[] = [];
-    const onError = vi.fn();
     const patches: Array<Record<string, unknown>> = [];
     const sockets: FakeWebSocket[] = [];
-    let disconnects = 0;
 
     const connectOnce = createMattermostConnectOnce({
       wsUrl: "wss://example.invalid/api/v4/websocket",
@@ -123,15 +159,8 @@ describe("mattermost websocket monitor", () => {
         return () => seq++;
       })(),
       onPosted: async () => {},
-      abortSignal: abort.signal,
       statusSink: (patch) => {
         patches.push(patch as Record<string, unknown>);
-        if (patch.lastDisconnect) {
-          disconnects++;
-          if (disconnects >= 2) {
-            abort.abort();
-          }
-        }
       },
       webSocketFactory: () => {
         const socket = new FakeWebSocket();
@@ -150,25 +179,93 @@ describe("mattermost websocket monitor", () => {
       },
     });
 
-    await runWithReconnect(connectOnce, {
-      abortSignal: abort.signal,
-      initialDelayMs: 1,
-      onError,
-      onReconnect: (delay) => reconnectDelays.push(delay),
-    });
+    const firstAttempt = connectOnce();
+    await expect(firstAttempt).rejects.toMatchObject({ name: "WebSocketClosedBeforeOpenError" });
+
+    await connectOnce();
 
     expect(sockets).toHaveLength(2);
-    expect(sockets[0].closeCalls).toBe(1);
-    expect(sockets[1].sent).toHaveLength(1);
-    expect(JSON.parse(sockets[1].sent[0])).toMatchObject({
+    const firstSocket = expectDefined(sockets[0], "first Mattermost socket");
+    const secondSocket = expectDefined(sockets[1], "second Mattermost socket");
+    expect(firstSocket.closeCalls).toBe(1);
+    expect(secondSocket.sent).toHaveLength(1);
+    expect(JSON.parse(expectDefined(secondSocket.sent[0], "Mattermost auth payload"))).toEqual({
       action: "authentication_challenge",
       data: { token: "token" },
       seq: 1,
     });
-    expect(onError).toHaveBeenCalledTimes(1);
-    expect(reconnectDelays).toEqual([1]);
-    expect(patches.some((patch) => patch.connected === true)).toBe(true);
-    expect(patches.filter((patch) => patch.connected === false)).toHaveLength(2);
+    expect(countMatching(patches, (patch) => patch.connected === true)).toBe(1);
+    expect(countMatching(patches, (patch) => patch.connected === false)).toBe(2);
+  });
+
+  it("accepts large valid post envelopes and rejects oversized websocket payloads", async () => {
+    const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("expected TCP websocket server address");
+    }
+
+    const quotedCardBody = '"'.repeat(380_000);
+    const largeProps = { cards: [{ body: quotedCardBody }] };
+    const largePostEnvelope = JSON.stringify({
+      event: "posted",
+      data: {
+        post: JSON.stringify({
+          id: "post-large",
+          message: "large Mattermost integration post",
+          props: largeProps,
+        }),
+      },
+    });
+    expect(JSON.stringify(largeProps).length).toBeLessThan(800_000);
+    expect(Buffer.byteLength(largePostEnvelope)).toBeGreaterThan(1024 * 1024);
+    expect(Buffer.byteLength(largePostEnvelope)).toBeLessThan(16 * 1024 * 1024);
+
+    const runtime = testRuntime();
+    const onPosted = vi.fn(async () => {});
+    server.on("connection", (socket) => {
+      socket.once("message", () => {
+        socket.send(
+          JSON.stringify({
+            event: "posted",
+            data: {
+              post: JSON.stringify({
+                id: "post-1",
+                message: "normal Mattermost post",
+              }),
+            },
+          }),
+        );
+        socket.send(largePostEnvelope);
+        socket.send(Buffer.alloc(16 * 1024 * 1024 + 1, 0x78));
+      });
+    });
+
+    try {
+      await createMattermostConnectOnce({
+        wsUrl: `ws://127.0.0.1:${address.port}`,
+        botToken: "token",
+        runtime,
+        nextSeq: () => 1,
+        onPosted,
+      })();
+    } finally {
+      server.close();
+      await once(server, "close");
+    }
+
+    expect(onPosted).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "post-1", message: "normal Mattermost post" }),
+      expect.any(Object),
+    );
+    expect(onPosted).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "post-large", props: largeProps }),
+      expect.any(Object),
+    );
+    expect(runtime.error).toHaveBeenCalledWith(
+      expect.stringContaining("Max payload size exceeded"),
+    );
   });
 
   it("dispatches reaction events to the reaction handler", async () => {
@@ -209,24 +306,16 @@ describe("mattermost websocket monitor", () => {
 
     expect(onReaction).toHaveBeenCalledTimes(1);
     expect(onPosted).not.toHaveBeenCalled();
-    const payload = onReaction.mock.calls[0]?.[0];
-    expect(payload).toMatchObject({
-      event: "reaction_added",
-      data: {
-        reaction: JSON.stringify({
-          user_id: "user-1",
-          post_id: "post-1",
-          emoji_name: "thumbsup",
-        }),
-      },
+    const reaction = JSON.stringify({
+      user_id: "user-1",
+      post_id: "post-1",
+      emoji_name: "thumbsup",
     });
-    expect(payload.data?.reaction).toBe(
-      JSON.stringify({
-        user_id: "user-1",
-        post_id: "post-1",
-        emoji_name: "thumbsup",
-      }),
-    );
+    const payload = onReaction.mock.calls.at(0)?.[0];
+    expect(payload).toEqual({
+      event: "reaction_added",
+      data: { reaction },
+    });
   });
 
   it("terminates when bot update_at changes (disable/enable cycle)", async () => {
@@ -294,6 +383,82 @@ describe("mattermost websocket monitor", () => {
     vi.useRealTimers();
   });
 
+  it("continues protocol keepalive when Mattermost responds with pong", async () => {
+    vi.useFakeTimers();
+    const socket = new FakeWebSocket();
+    const connectOnce = createMattermostConnectOnce({
+      wsUrl: "wss://example.invalid/api/v4/websocket",
+      botToken: "token",
+      runtime: testRuntime(),
+      nextSeq: () => 1,
+      onPosted: async () => {},
+      webSocketFactory: () => socket,
+      pingIntervalMs: 100,
+      pongTimeoutMs: 25,
+    });
+
+    const connected = connectOnce();
+    socket.emitOpen();
+
+    await vi.advanceTimersByTimeAsync(100);
+    expect(socket.pingCalls).toBe(1);
+
+    socket.emitPong();
+    await vi.advanceTimersByTimeAsync(25);
+    expect(socket.terminateCalls).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(75);
+    expect(socket.pingCalls).toBe(2);
+
+    socket.emitClose(1000);
+    await connected;
+    vi.useRealTimers();
+  });
+
+  it("terminates silent websocket drops when Mattermost misses pong timeout", async () => {
+    vi.useFakeTimers();
+    const socket = new FakeWebSocket();
+    const runtime = testRuntime();
+    let pollCount = 0;
+    const connectOnce = createMattermostConnectOnce({
+      wsUrl: "wss://example.invalid/api/v4/websocket",
+      botToken: "token",
+      runtime,
+      nextSeq: () => 1,
+      onPosted: async () => {},
+      webSocketFactory: () => socket,
+      getBotUpdateAt: async () => {
+        pollCount++;
+        return 1000;
+      },
+      healthCheckIntervalMs: 100,
+      pingIntervalMs: 50,
+      pongTimeoutMs: 25,
+    });
+
+    const connected = connectOnce();
+    socket.emitOpen();
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pollCount).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(50);
+    expect(socket.pingCalls).toBe(1);
+    expect(socket.terminateCalls).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(25);
+    expect(socket.terminateCalls).toBe(1);
+    expect(runtime.error).toHaveBeenCalledWith("mattermost websocket pong timeout — reconnecting");
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect(socket.pingCalls).toBe(1);
+    expect(pollCount).toBe(1);
+
+    socket.emitClose(1006);
+    await connected;
+    vi.useRealTimers();
+  });
+
   it("does not terminate when getBotUpdateAt throws", async () => {
     vi.useFakeTimers();
     const socket = new FakeWebSocket();
@@ -307,7 +472,9 @@ describe("mattermost websocket monitor", () => {
       onPosted: async () => {},
       webSocketFactory: () => socket,
       getBotUpdateAt: async () => {
-        if (shouldThrow) throw new Error("network error");
+        if (shouldThrow) {
+          throw new Error("network error");
+        }
         return 1000;
       },
       healthCheckIntervalMs: 100,

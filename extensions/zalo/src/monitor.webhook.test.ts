@@ -1,23 +1,23 @@
+// Zalo tests cover monitor.webhook plugin behavior.
 import type { RequestListener } from "node:http";
-import { createEmptyPluginRegistry } from "openclaw/plugin-sdk/testing";
-import { setActivePluginRegistry } from "openclaw/plugin-sdk/testing";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { withServer } from "../../../test/helpers/http-test-server.js";
-import type { OpenClawConfig, PluginRuntime } from "../runtime-api.js";
 import {
-  createImageLifecycleCore,
-  createImageUpdate,
-  createTextUpdate,
-  expectImageLifecycleDelivery,
-  postWebhookReplay,
-} from "../test-support/lifecycle-test-support.js";
+  createEmptyPluginRegistry,
+  setActivePluginRegistry,
+} from "openclaw/plugin-sdk/plugin-test-runtime";
+import { withServer } from "openclaw/plugin-sdk/test-env";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { OpenClawConfig, PluginRuntime } from "../runtime-api.js";
+import type { ZaloRuntimeEnv } from "./monitor.types.js";
 import {
   clearZaloWebhookSecurityStateForTest,
   getZaloWebhookRateLimitStateSizeForTest,
   getZaloWebhookStatusCounterSizeForTest,
-  handleZaloWebhookRequest,
+  handleZaloWebhookRequest as handleZaloWebhookRequestInternal,
   registerZaloWebhookTarget,
-} from "./monitor.js";
+  type ZaloWebhookProcessUpdate,
+  ZaloRetryableWebhookError,
+} from "./monitor.webhook.js";
+import { createTextUpdate, postWebhookReplay } from "./test-support/lifecycle-test-support.js";
 import type { ResolvedZaloAccount } from "./types.js";
 const DEFAULT_ACCOUNT: ResolvedZaloAccount = {
   accountId: "default",
@@ -27,13 +27,21 @@ const DEFAULT_ACCOUNT: ResolvedZaloAccount = {
   config: {},
 };
 
-const webhookRequestHandler: RequestListener = async (req, res) => {
-  const handled = await handleZaloWebhookRequest(req, res);
-  if (!handled) {
-    res.statusCode = 404;
-    res.end("not found");
-  }
-};
+function createWebhookRequestHandler(
+  processUpdate: ZaloWebhookProcessUpdate = async () => {},
+): RequestListener {
+  return (req, res) => {
+    void (async () => {
+      const handled = await handleZaloWebhookRequestInternal(req, res, processUpdate);
+      if (!handled) {
+        res.statusCode = 404;
+        res.end("not found");
+      }
+    })();
+  };
+}
+
+const webhookRequestHandler = createWebhookRequestHandler();
 
 function registerTarget(params: {
   path: string;
@@ -42,46 +50,22 @@ function registerTarget(params: {
   account?: ResolvedZaloAccount;
   config?: OpenClawConfig;
   core?: PluginRuntime;
+  runtime?: Partial<ZaloRuntimeEnv>;
 }): () => void {
   return registerZaloWebhookTarget({
     token: "tok",
     account: params.account ?? DEFAULT_ACCOUNT,
     config: params.config ?? ({} as OpenClawConfig),
-    runtime: {},
+    runtime: (params.runtime ?? {}) as ZaloRuntimeEnv,
     core: params.core ?? ({} as PluginRuntime),
     secret: params.secret ?? "secret",
     path: params.path,
+    webhookUrl: `https://example.com${params.path}`,
+    webhookPath: params.path,
     mediaMaxMb: 5,
+    canHostMedia: true,
     statusSink: params.statusSink,
   });
-}
-
-function createPairingAuthCore(params?: { storeAllowFrom?: string[]; pairingCreated?: boolean }): {
-  core: PluginRuntime;
-  readAllowFromStore: ReturnType<typeof vi.fn>;
-  upsertPairingRequest: ReturnType<typeof vi.fn>;
-} {
-  const readAllowFromStore = vi.fn().mockResolvedValue(params?.storeAllowFrom ?? []);
-  const upsertPairingRequest = vi
-    .fn()
-    .mockResolvedValue({ code: "PAIRCODE", created: params?.pairingCreated ?? false });
-  const core = {
-    logging: {
-      shouldLogVerbose: () => false,
-    },
-    channel: {
-      pairing: {
-        readAllowFromStore,
-        upsertPairingRequest,
-        buildPairingReply: vi.fn(() => "Pairing code: PAIRCODE"),
-      },
-      commands: {
-        shouldComputeCommandAuthorized: vi.fn(() => false),
-        resolveCommandAuthorizedFromAuthorizers: vi.fn(() => false),
-      },
-    },
-  } as unknown as PluginRuntime;
-  return { core, readAllowFromStore, upsertPairingRequest };
 }
 
 async function postUntilRateLimited(params: {
@@ -109,6 +93,44 @@ async function postUntilRateLimited(params: {
     }
   }
   return false;
+}
+
+async function postWebhookJson(params: {
+  baseUrl: string;
+  path: string;
+  secret: string;
+  payload: unknown;
+}) {
+  return fetch(`${params.baseUrl}${params.path}`, {
+    method: "POST",
+    headers: {
+      "x-bot-api-secret-token": params.secret,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(params.payload),
+  });
+}
+
+async function expectTwoWebhookPostsOk(params: {
+  baseUrl: string;
+  first: { path: string; secret: string; payload: unknown };
+  second: { path: string; secret: string; payload: unknown };
+}) {
+  const first = await postWebhookJson({
+    baseUrl: params.baseUrl,
+    path: params.first.path,
+    secret: params.first.secret,
+    payload: params.first.payload,
+  });
+  const second = await postWebhookJson({
+    baseUrl: params.baseUrl,
+    path: params.second.path,
+    secret: params.second.secret,
+    payload: params.second.payload,
+  });
+
+  expect(first.status).toBe(200);
+  expect(second.status).toBe(200);
 }
 
 describe("handleZaloWebhookRequest", () => {
@@ -215,6 +237,55 @@ describe("handleZaloWebhookRequest", () => {
       unregister();
     }
   });
+
+  it("allows a retry after processUpdate throws a retryable replay error", async () => {
+    const error = vi.fn();
+    const unregister = registerTarget({
+      path: "/hook-retry-after-failure",
+      runtime: { error },
+    });
+    const payload = createTextUpdate({
+      messageId: "msg-retry-after-failure-1",
+      userId: "123",
+      userName: "",
+      chatId: "123",
+      text: "hello",
+    });
+    let attempts = 0;
+    const processUpdate = vi.fn<ZaloWebhookProcessUpdate>(async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new ZaloRetryableWebhookError("boom");
+      }
+    });
+
+    try {
+      await withServer(createWebhookRequestHandler(processUpdate), async (baseUrl) => {
+        const first = await postWebhookJson({
+          baseUrl,
+          path: "/hook-retry-after-failure",
+          secret: "secret",
+          payload,
+        });
+
+        expect(first.status).toBe(200);
+        await vi.waitFor(() => expect(error).toHaveBeenCalledTimes(1));
+
+        const second = await postWebhookJson({
+          baseUrl,
+          path: "/hook-retry-after-failure",
+          secret: "secret",
+          payload,
+        });
+
+        expect(second.status).toBe(200);
+        await vi.waitFor(() => expect(processUpdate).toHaveBeenCalledTimes(2));
+      });
+    } finally {
+      unregister();
+    }
+  });
+
   it("keeps replay dedupe isolated per authenticated target", async () => {
     const sinkA = vi.fn();
     const sinkB = vi.fn();
@@ -242,25 +313,11 @@ describe("handleZaloWebhookRequest", () => {
 
     try {
       await withServer(webhookRequestHandler, async (baseUrl) => {
-        const first = await fetch(`${baseUrl}/hook-replay-scope`, {
-          method: "POST",
-          headers: {
-            "x-bot-api-secret-token": "secret-a",
-            "content-type": "application/json",
-          },
-          body: JSON.stringify(payload),
+        await expectTwoWebhookPostsOk({
+          baseUrl,
+          first: { path: "/hook-replay-scope", secret: "secret-a", payload },
+          second: { path: "/hook-replay-scope", secret: "secret-b", payload },
         });
-        const second = await fetch(`${baseUrl}/hook-replay-scope`, {
-          method: "POST",
-          headers: {
-            "x-bot-api-secret-token": "secret-b",
-            "content-type": "application/json",
-          },
-          body: JSON.stringify(payload),
-        });
-
-        expect(first.status).toBe(200);
-        expect(second.status).toBe(200);
       });
 
       expect(sinkA).toHaveBeenCalledTimes(1);
@@ -291,25 +348,11 @@ describe("handleZaloWebhookRequest", () => {
 
     try {
       await withServer(webhookRequestHandler, async (baseUrl) => {
-        const first = await fetch(`${baseUrl}/hook-replay-chat-scope`, {
-          method: "POST",
-          headers: {
-            "x-bot-api-secret-token": "secret",
-            "content-type": "application/json",
-          },
-          body: JSON.stringify(firstPayload),
+        await expectTwoWebhookPostsOk({
+          baseUrl,
+          first: { path: "/hook-replay-chat-scope", secret: "secret", payload: firstPayload },
+          second: { path: "/hook-replay-chat-scope", secret: "secret", payload: secondPayload },
         });
-        const second = await fetch(`${baseUrl}/hook-replay-chat-scope`, {
-          method: "POST",
-          headers: {
-            "x-bot-api-secret-token": "secret",
-            "content-type": "application/json",
-          },
-          body: JSON.stringify(secondPayload),
-        });
-
-        expect(first.status).toBe(200);
-        expect(second.status).toBe(200);
       });
 
       expect(sink).toHaveBeenCalledTimes(2);
@@ -338,25 +381,11 @@ describe("handleZaloWebhookRequest", () => {
 
     try {
       await withServer(webhookRequestHandler, async (baseUrl) => {
-        const first = await fetch(`${baseUrl}/hook-replay-sender-scope`, {
-          method: "POST",
-          headers: {
-            "x-bot-api-secret-token": "secret",
-            "content-type": "application/json",
-          },
-          body: JSON.stringify(firstPayload),
+        await expectTwoWebhookPostsOk({
+          baseUrl,
+          first: { path: "/hook-replay-sender-scope", secret: "secret", payload: firstPayload },
+          second: { path: "/hook-replay-sender-scope", secret: "secret", payload: secondPayload },
         });
-        const second = await fetch(`${baseUrl}/hook-replay-sender-scope`, {
-          method: "POST",
-          headers: {
-            "x-bot-api-secret-token": "secret",
-            "content-type": "application/json",
-          },
-          body: JSON.stringify(secondPayload),
-        });
-
-        expect(first.status).toBe(200);
-        expect(second.status).toBe(200);
       });
 
       expect(sink).toHaveBeenCalledTimes(2);
@@ -365,7 +394,7 @@ describe("handleZaloWebhookRequest", () => {
     }
   });
 
-  it("does not throw when replay metadata is partially missing", async () => {
+  it("accepts replay metadata when optional fields are missing", async () => {
     const sink = vi.fn();
     const unregister = registerTarget({ path: "/hook-replay-partial", statusSink: sink });
     const payload = {
@@ -397,50 +426,90 @@ describe("handleZaloWebhookRequest", () => {
     }
   });
 
-  it("downloads inbound image media from webhook photo_url and preserves display_name", async () => {
-    const {
-      core,
-      finalizeInboundContextMock,
-      recordInboundSessionMock,
-      fetchRemoteMediaMock,
-      saveMediaBufferMock,
-    } = createImageLifecycleCore();
-    const unregister = registerTarget({
-      path: "/hook-image",
-      core,
+  it("keeps replay dedupe isolated when path/account values collide under colon-joined keys", async () => {
+    const sinkA = vi.fn();
+    const sinkB = vi.fn();
+    // Old key format `${path}:${accountId}:${event_name}:${messageId}` would collide for these two targets.
+    const unregisterA = registerTarget({
+      path: "/hook-replay-collision:a",
+      secret: "secret-a",
+      statusSink: sinkA,
       account: {
         ...DEFAULT_ACCOUNT,
-        config: {
-          dmPolicy: "open",
-        },
+        accountId: "team",
       },
     });
-    const payload = createImageUpdate();
+    const unregisterB = registerTarget({
+      path: "/hook-replay-collision",
+      secret: "secret-b",
+      statusSink: sinkB,
+      account: {
+        ...DEFAULT_ACCOUNT,
+        accountId: "a:team",
+      },
+    });
+    const payload = createTextUpdate({
+      messageId: "msg-replay-collision-1",
+      userId: "123",
+      userName: "",
+      chatId: "123",
+      text: "hello",
+    });
 
     try {
       await withServer(webhookRequestHandler, async (baseUrl) => {
-        const response = await fetch(`${baseUrl}/hook-image`, {
-          method: "POST",
-          headers: {
-            "x-bot-api-secret-token": "secret",
-            "content-type": "application/json",
-          },
-          body: JSON.stringify(payload),
+        await expectTwoWebhookPostsOk({
+          baseUrl,
+          first: { path: "/hook-replay-collision:a", secret: "secret-a", payload },
+          second: { path: "/hook-replay-collision", secret: "secret-b", payload },
         });
-
-        expect(response.status).toBe(200);
       });
-    } finally {
-      unregister();
-    }
 
-    await vi.waitFor(() => expect(fetchRemoteMediaMock).toHaveBeenCalledTimes(1));
-    expectImageLifecycleDelivery({
-      fetchRemoteMediaMock,
-      saveMediaBufferMock,
-      finalizeInboundContextMock,
-      recordInboundSessionMock,
+      expect(sinkA).toHaveBeenCalledTimes(1);
+      expect(sinkB).toHaveBeenCalledTimes(1);
+    } finally {
+      unregisterA();
+      unregisterB();
+    }
+  });
+
+  it("keeps replay dedupe isolated across different webhook paths", async () => {
+    const sinkA = vi.fn();
+    const sinkB = vi.fn();
+    const sharedSecret = "secret";
+    const unregisterA = registerTarget({
+      path: "/hook-replay-scope-a",
+      secret: sharedSecret,
+      statusSink: sinkA,
     });
+    const unregisterB = registerTarget({
+      path: "/hook-replay-scope-b",
+      secret: sharedSecret,
+      statusSink: sinkB,
+    });
+    const payload = createTextUpdate({
+      messageId: "msg-replay-cross-path-1",
+      userId: "123",
+      userName: "",
+      chatId: "123",
+      text: "hello",
+    });
+
+    try {
+      await withServer(webhookRequestHandler, async (baseUrl) => {
+        await expectTwoWebhookPostsOk({
+          baseUrl,
+          first: { path: "/hook-replay-scope-a", secret: sharedSecret, payload },
+          second: { path: "/hook-replay-scope-b", secret: sharedSecret, payload },
+        });
+      });
+
+      expect(sinkA).toHaveBeenCalledTimes(1);
+      expect(sinkB).toHaveBeenCalledTimes(1);
+    } finally {
+      unregisterA();
+      unregisterB();
+    }
   });
 
   it("returns 429 when per-path request rate exceeds threshold", async () => {
@@ -593,66 +662,5 @@ describe("handleZaloWebhookRequest", () => {
     } finally {
       unregister();
     }
-  });
-
-  it("scopes DM pairing store reads and writes to accountId", async () => {
-    const { core, readAllowFromStore, upsertPairingRequest } = createPairingAuthCore({
-      pairingCreated: false,
-    });
-    const account: ResolvedZaloAccount = {
-      ...DEFAULT_ACCOUNT,
-      accountId: "work",
-      config: {
-        dmPolicy: "pairing",
-        allowFrom: [],
-      },
-    };
-    const unregister = registerTarget({
-      path: "/hook-account-scope",
-      account,
-      core,
-    });
-
-    const payload = {
-      event_name: "message.text.received",
-      message: {
-        from: { id: "123", name: "Attacker" },
-        chat: { id: "dm-work", chat_type: "PRIVATE" },
-        message_id: "msg-work-1",
-        date: Math.floor(Date.now() / 1000),
-        text: "hello",
-      },
-    };
-
-    try {
-      await withServer(webhookRequestHandler, async (baseUrl) => {
-        const response = await fetch(`${baseUrl}/hook-account-scope`, {
-          method: "POST",
-          headers: {
-            "x-bot-api-secret-token": "secret",
-            "content-type": "application/json",
-          },
-          body: JSON.stringify(payload),
-        });
-
-        expect(response.status).toBe(200);
-      });
-    } finally {
-      unregister();
-    }
-
-    expect(readAllowFromStore).toHaveBeenCalledWith(
-      expect.objectContaining({
-        channel: "zalo",
-        accountId: "work",
-      }),
-    );
-    expect(upsertPairingRequest).toHaveBeenCalledWith(
-      expect.objectContaining({
-        channel: "zalo",
-        id: "123",
-        accountId: "work",
-      }),
-    );
   });
 });

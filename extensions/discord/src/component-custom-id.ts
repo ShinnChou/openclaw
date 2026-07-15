@@ -1,18 +1,76 @@
-import { parseCustomId, type ComponentParserResult } from "@buape/carbon";
+// Discord plugin module implements component custom id behavior.
+import {
+  escapeCustomIdFieldValue,
+  needsCustomIdFieldEscaping,
+  unescapeCustomIdFieldValue,
+} from "./custom-id-codec.js";
+import { parseCustomId, type ComponentParserResult } from "./internal/discord.js";
 
 export const DISCORD_COMPONENT_CUSTOM_ID_KEY = "occomp";
 export const DISCORD_MODAL_CUSTOM_ID_KEY = "ocmodal";
+const DISCORD_ACTIVITY_CUSTOM_ID_KEY = "ocactivity";
+const ENCODED_CUSTOM_ID_VERSION = "1";
+
+export function buildDiscordActivityCustomId(widgetId: string): string {
+  return `${DISCORD_ACTIVITY_CUSTOM_ID_KEY}:v=${ENCODED_CUSTOM_ID_VERSION};wid=${widgetId}`;
+}
+
+export function parseDiscordActivityCustomId(id: string): { widgetId: string } | null {
+  const parsed = parseCustomId(id);
+  if (
+    parsed.key !== DISCORD_ACTIVITY_CUSTOM_ID_KEY ||
+    parsed.data.v !== ENCODED_CUSTOM_ID_VERSION ||
+    typeof parsed.data.wid !== "string" ||
+    !/^[A-Za-z0-9_-]{22}$/.test(parsed.data.wid)
+  ) {
+    return null;
+  }
+  return { widgetId: parsed.data.wid };
+}
+
+export function parseDiscordActivityCustomIdForInteraction(id: string): ComponentParserResult {
+  const parsed = parseDiscordActivityCustomId(id);
+  return parsed
+    ? { key: DISCORD_ACTIVITY_CUSTOM_ID_KEY, data: { widgetId: parsed.widgetId } }
+    : parseCustomId(id);
+}
+
+function decodeParsedCustomIdData(
+  data: ComponentParserResult["data"],
+): ComponentParserResult["data"] {
+  if (data.e !== ENCODED_CUSTOM_ID_VERSION) {
+    return data;
+  }
+  return Object.fromEntries(
+    Object.entries(data).map(([key, value]) => [
+      key,
+      typeof value === "string" ? unescapeCustomIdFieldValue(value) : value,
+    ]),
+  ) as ComponentParserResult["data"];
+}
 
 export function buildDiscordComponentCustomId(params: {
   componentId: string;
   modalId?: string;
 }): string {
-  const base = `${DISCORD_COMPONENT_CUSTOM_ID_KEY}:cid=${params.componentId}`;
-  return params.modalId ? `${base};mid=${params.modalId}` : base;
+  const encoded =
+    needsCustomIdFieldEscaping(params.componentId) ||
+    needsCustomIdFieldEscaping(params.modalId ?? "");
+  const componentId = encoded ? escapeCustomIdFieldValue(params.componentId) : params.componentId;
+  const base = encoded
+    ? `${DISCORD_COMPONENT_CUSTOM_ID_KEY}:e=${ENCODED_CUSTOM_ID_VERSION};cid=${componentId}`
+    : `${DISCORD_COMPONENT_CUSTOM_ID_KEY}:cid=${componentId}`;
+  const modalId = params.modalId;
+  if (!modalId) {
+    return base;
+  }
+  return `${base};mid=${encoded ? escapeCustomIdFieldValue(modalId) : modalId}`;
 }
 
 export function buildDiscordModalCustomId(modalId: string): string {
-  return `${DISCORD_MODAL_CUSTOM_ID_KEY}:mid=${modalId}`;
+  return needsCustomIdFieldEscaping(modalId)
+    ? `${DISCORD_MODAL_CUSTOM_ID_KEY}:e=${ENCODED_CUSTOM_ID_VERSION};mid=${escapeCustomIdFieldValue(modalId)}`
+    : `${DISCORD_MODAL_CUSTOM_ID_KEY}:mid=${modalId}`;
 }
 
 export function parseDiscordComponentCustomId(
@@ -22,11 +80,12 @@ export function parseDiscordComponentCustomId(
   if (parsed.key !== DISCORD_COMPONENT_CUSTOM_ID_KEY) {
     return null;
   }
-  const componentId = parsed.data.cid;
+  const data = decodeParsedCustomIdData(parsed.data);
+  const componentId = data.cid;
   if (typeof componentId !== "string" || !componentId.trim()) {
     return null;
   }
-  const modalId = parsed.data.mid;
+  const modalId = data.mid;
   return {
     componentId,
     modalId: typeof modalId === "string" && modalId.trim() ? modalId : undefined,
@@ -38,7 +97,8 @@ export function parseDiscordModalCustomId(id: string): string | null {
   if (parsed.key !== DISCORD_MODAL_CUSTOM_ID_KEY) {
     return null;
   }
-  const modalId = parsed.data.mid;
+  const data = decodeParsedCustomIdData(parsed.data);
+  const modalId = data.mid;
   if (typeof modalId !== "string" || !modalId.trim()) {
     return null;
   }
@@ -49,7 +109,7 @@ function isDiscordComponentWildcardRegistrationId(id: string): boolean {
   return /^__openclaw_discord_component_[a-z_]+_wildcard__$/.test(id);
 }
 
-export function parseDiscordComponentCustomIdForCarbon(id: string): ComponentParserResult {
+export function parseDiscordComponentCustomIdForInteraction(id: string): ComponentParserResult {
   if (id === "*" || isDiscordComponentWildcardRegistrationId(id)) {
     return { key: "*", data: {} };
   }
@@ -57,10 +117,10 @@ export function parseDiscordComponentCustomIdForCarbon(id: string): ComponentPar
   if (parsed.key !== DISCORD_COMPONENT_CUSTOM_ID_KEY) {
     return parsed;
   }
-  return { key: "*", data: parsed.data };
+  return { key: "*", data: decodeParsedCustomIdData(parsed.data) };
 }
 
-export function parseDiscordModalCustomIdForCarbon(id: string): ComponentParserResult {
+export function parseDiscordModalCustomIdForInteraction(id: string): ComponentParserResult {
   if (id === "*" || isDiscordComponentWildcardRegistrationId(id)) {
     return { key: "*", data: {} };
   }
@@ -68,5 +128,5 @@ export function parseDiscordModalCustomIdForCarbon(id: string): ComponentParserR
   if (parsed.key !== DISCORD_MODAL_CUSTOM_ID_KEY) {
     return parsed;
   }
-  return { key: "*", data: parsed.data };
+  return { key: "*", data: decodeParsedCustomIdData(parsed.data) };
 }

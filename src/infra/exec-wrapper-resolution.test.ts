@@ -1,17 +1,22 @@
+// Tests execution wrapper resolution for shell commands.
 import { describe, expect, test } from "vitest";
+import { unwrapEnvInvocation } from "./command-carriers.js";
 import {
-  basenameLower,
-  extractShellWrapperCommand,
-  extractShellWrapperInlineCommand,
-  hasEnvManipulationBeforeShellWrapper,
   isDispatchWrapperExecutable,
-  isShellWrapperExecutable,
-  normalizeExecutableToken,
   resolveDispatchWrapperTrustPlan,
-  unwrapEnvInvocation,
+} from "./dispatch-wrapper-resolution.js";
+import {
+  extractEnvAssignmentKeysFromDispatchWrappers,
+  extractShellWrapperCommand,
+  hasEnvManipulationBeforeShellWrapper,
+  isShellWrapperExecutable,
+  isShellWrapperInvocation,
+  normalizeExecutableToken,
+  resolveShellWrapperTransportArgv,
   unwrapKnownDispatchWrapperInvocation,
   unwrapKnownShellMultiplexerInvocation,
 } from "./exec-wrapper-resolution.js";
+import { extractShellWrapperInlineCommand } from "./shell-wrapper-resolution.js";
 
 function supportsScriptPositionalCommandForTests(): boolean {
   return process.platform === "darwin" || process.platform === "freebsd";
@@ -35,16 +40,6 @@ function expectTransparentDispatchWrapperCase(params: {
   });
 }
 
-describe("basenameLower", () => {
-  test.each([
-    { token: " Bun.CMD ", expected: "bun.cmd" },
-    { token: "C:\\tools\\PwSh.EXE", expected: "pwsh.exe" },
-    { token: "/tmp/bash", expected: "bash" },
-  ])("normalizes basenames for %j", ({ token, expected }) => {
-    expect(basenameLower(token)).toBe(expected);
-  });
-});
-
 describe("normalizeExecutableToken", () => {
   test.each([
     { token: "bun.cmd", expected: "bun" },
@@ -65,6 +60,7 @@ describe("wrapper classification", () => {
     { token: "caffeinate", dispatch: true, shell: false },
     { token: "sandbox-exec", dispatch: true, shell: false },
     { token: "script", dispatch: true, shell: false },
+    { token: "flock", dispatch: true, shell: false },
     { token: "time", dispatch: true, shell: false },
     { token: "timeout.exe", dispatch: true, shell: false },
     { token: "bash", dispatch: false, shell: true },
@@ -112,6 +108,22 @@ describe("unwrapEnvInvocation", () => {
     {
       argv: ["env", "--chdir=/tmp", "pwsh", "-Command", "Get-Date"],
       expected: ["pwsh", "-Command", "Get-Date"],
+    },
+    {
+      argv: ["env", "-P", "/usr/bin", "python3", "-c", "print(1)"],
+      expected: ["python3", "-c", "print(1)"],
+    },
+    {
+      argv: ["env", "-S", "python3 -c", "print(1)"],
+      expected: ["python3", "-c", "print(1)"],
+    },
+    {
+      argv: ["env", "--split-string=python3 -c", "print(1)"],
+      expected: ["python3", "-c", "print(1)"],
+    },
+    {
+      argv: ["env", "-Spython3 -c", "print(1)"],
+      expected: ["python3", "-c", "print(1)"],
     },
     {
       argv: ["env", "-", "bash", "-lc", "echo hi"],
@@ -167,6 +179,34 @@ describe("unwrapKnownDispatchWrapperInvocation", () => {
       expected: { kind: "unwrapped", wrapper: "time", argv: ["bash", "-lc", "echo hi"] },
     },
     {
+      argv: ["flock", "-n", "/tmp/openclaw.lock", "bash", "-lc", "echo hi"],
+      expected: { kind: "unwrapped", wrapper: "flock", argv: ["bash", "-lc", "echo hi"] },
+    },
+    {
+      argv: ["flock", "-en", "/tmp/openclaw.lock", "bash", "-lc", "echo hi"],
+      expected: { kind: "unwrapped", wrapper: "flock", argv: ["bash", "-lc", "echo hi"] },
+    },
+    {
+      argv: ["flock", "-E", "1", "/tmp/openclaw.lock", "bash", "-lc", "echo hi"],
+      expected: { kind: "unwrapped", wrapper: "flock", argv: ["bash", "-lc", "echo hi"] },
+    },
+    {
+      argv: ["flock", "-F", "/tmp/openclaw.lock", "bash", "-lc", "echo hi"],
+      expected: { kind: "unwrapped", wrapper: "flock", argv: ["bash", "-lc", "echo hi"] },
+    },
+    {
+      argv: ["flock", "-o", "/tmp/openclaw.lock", "bash", "-lc", "echo hi"],
+      expected: { kind: "unwrapped", wrapper: "flock", argv: ["bash", "-lc", "echo hi"] },
+    },
+    {
+      argv: ["flock", "--nb", "/tmp/openclaw.lock", "bash", "-lc", "echo hi"],
+      expected: { kind: "unwrapped", wrapper: "flock", argv: ["bash", "-lc", "echo hi"] },
+    },
+    {
+      argv: ["flock", "--wait", "1", "/tmp/openclaw.lock", "bash", "-lc", "echo hi"],
+      expected: { kind: "unwrapped", wrapper: "flock", argv: ["bash", "-lc", "echo hi"] },
+    },
+    {
       argv: ["timeout", "--signal=TERM", "5s", "bash", "-lc", "echo hi"],
       expected: { kind: "unwrapped", wrapper: "timeout", argv: ["bash", "-lc", "echo hi"] },
     },
@@ -204,6 +244,18 @@ describe("unwrapKnownDispatchWrapperInvocation", () => {
     {
       argv: ["timeout", "--bogus", "5s", "bash", "-lc", "echo hi"],
       expected: { kind: "blocked", wrapper: "timeout" },
+    },
+    {
+      argv: ["flock", "/tmp/openclaw.lock", "-c", "echo hi"],
+      expected: { kind: "blocked", wrapper: "flock" },
+    },
+    {
+      argv: ["flock", "-un", "/tmp/openclaw.lock", "bash", "-lc", "echo hi"],
+      expected: { kind: "blocked", wrapper: "flock" },
+    },
+    {
+      argv: ["flock", "-u", "9"],
+      expected: { kind: "blocked", wrapper: "flock" },
     },
     {
       argv: ["arch", "-e", "FOO=bar", "bash", "-lc", "echo hi"],
@@ -255,6 +307,23 @@ describe("resolveDispatchWrapperTrustPlan", () => {
   });
 
   test.each([
+    ["npm", "install"],
+    ["pnpm", "install"],
+    ["pnpm", "run", "build"],
+  ])(
+    "does not classify ordinary package-manager subcommands as dispatch wrappers: %s %s",
+    (executable, ...args) => {
+      const argv = [executable, ...args];
+      expect(unwrapKnownDispatchWrapperInvocation(argv)).toEqual({ kind: "not-wrapper" });
+      expect(resolveDispatchWrapperTrustPlan(argv)).toEqual({
+        argv,
+        wrappers: [],
+        policyBlocked: false,
+      });
+    },
+  );
+
+  test.each([
     {
       argv: ["caffeinate", "-d", "-t", "60", "bash", "-lc", "echo hi"],
       wrapper: "caffeinate",
@@ -288,6 +357,21 @@ describe("resolveDispatchWrapperTrustPlan", () => {
     {
       argv: ["time", "-p", "bash", "-lc", "echo hi"],
       wrapper: "time",
+      effectiveArgv: ["bash", "-lc", "echo hi"],
+    },
+    {
+      argv: ["flock", "--timeout=2", "/tmp/openclaw.lock", "bash", "-lc", "echo hi"],
+      wrapper: "flock",
+      effectiveArgv: ["bash", "-lc", "echo hi"],
+    },
+    {
+      argv: ["flock", "--close", "/tmp/openclaw.lock", "bash", "-lc", "echo hi"],
+      wrapper: "flock",
+      effectiveArgv: ["bash", "-lc", "echo hi"],
+    },
+    {
+      argv: ["flock", "--no-fork", "/tmp/openclaw.lock", "bash", "-lc", "echo hi"],
+      wrapper: "flock",
       effectiveArgv: ["bash", "-lc", "echo hi"],
     },
     {
@@ -347,6 +431,33 @@ describe("resolveDispatchWrapperTrustPlan", () => {
     });
   });
 
+  test("blocks script transcript wrappers even when the inner command is parseable", () => {
+    expect(
+      resolveDispatchWrapperTrustPlan(
+        ["script", "-q", "/tmp/session.log", "bash", "-lc", "echo hi"],
+        undefined,
+        "darwin",
+      ),
+    ).toEqual({
+      argv: ["script", "-q", "/tmp/session.log", "bash", "-lc", "echo hi"],
+      wrappers: ["script"],
+      policyBlocked: true,
+      blockedWrapper: "script",
+    });
+  });
+
+  test.each([
+    ["short output option", ["time", "-o", "/tmp/time.log", "bash", "-lc", "echo hi"]],
+    ["long output option", ["time", "--output=/tmp/time.log", "bash", "-lc", "echo hi"]],
+  ])("blocks GNU time file-output wrappers for %s", (_name, argv) => {
+    expect(resolveDispatchWrapperTrustPlan(argv)).toEqual({
+      argv,
+      wrappers: ["time"],
+      policyBlocked: true,
+      blockedWrapper: "time",
+    });
+  });
+
   test("blocks wrapper overflow beyond the configured depth", () => {
     expect(
       resolveDispatchWrapperTrustPlan(["nohup", "timeout", "5s", "bash", "-lc", "echo hi"], 1),
@@ -382,22 +493,192 @@ describe("hasEnvManipulationBeforeShellWrapper", () => {
   });
 });
 
+describe("resolveShellWrapperTransportArgv", () => {
+  test.each([
+    {
+      argv: ["env", "cmd.exe", "/d", "/s", "/c", "echo hi"],
+      expected: ["cmd.exe", "/d", "/s", "/c", "echo hi"],
+    },
+    {
+      argv: ["env", "FOO=bar", "cmd.exe", "/d", "/s", "/c", "echo hi"],
+      expected: ["cmd.exe", "/d", "/s", "/c", "echo hi"],
+    },
+    {
+      argv: ["bash", "script.sh"],
+      expected: null,
+    },
+  ])("resolves wrapper transport argv for %j", ({ argv, expected }) => {
+    expect(resolveShellWrapperTransportArgv(argv)).toEqual(expected);
+  });
+});
+
+describe("isShellWrapperInvocation", () => {
+  test.each([
+    {
+      argv: ["bash", "script.sh"],
+      expected: true,
+    },
+    {
+      argv: ["/usr/bin/env", "SHELLOPTS=xtrace", "bash", "-lc", "echo hi"],
+      expected: true,
+    },
+    {
+      argv: ["busybox", "sh", "script.sh"],
+      expected: true,
+    },
+    {
+      argv: ["/usr/bin/env", "FOO=bar", "/usr/bin/printf", "ok"],
+      expected: false,
+    },
+  ])("detects shell-wrapper executable invocations for %j", ({ argv, expected }) => {
+    expect(isShellWrapperInvocation(argv)).toBe(expected);
+  });
+});
+
+describe("extractEnvAssignmentKeysFromDispatchWrappers", () => {
+  test.each([
+    {
+      argv: ["env", "FOO=bar", "BAR=baz", "bash", "-lc", "echo hi"],
+      expected: ["BAR", "FOO"],
+    },
+    {
+      argv: ["nice", "-n", "5", "env", "-u", "PATH", "TERM=xterm", "bash", "-lc", "echo hi"],
+      expected: ["TERM"],
+    },
+    {
+      argv: ["env", "--split-string", "FOO=bar", "bash", "-lc", "echo hi"],
+      expected: [],
+    },
+    {
+      argv: ["env", "--", "bash", "-lc", "echo hi"],
+      expected: [],
+    },
+  ])("extracts env assignment prelude keys for %j", ({ argv, expected }) => {
+    expect(extractEnvAssignmentKeysFromDispatchWrappers(argv)).toEqual(expected);
+  });
+});
+
 describe("extractShellWrapperCommand", () => {
   test.each([
     {
       argv: ["bash", "-lc", "echo hi"],
       expectedInline: "echo hi",
-      expectedCommand: { isWrapper: true, command: "echo hi" },
+      expectedCommand: { isWrapper: true, command: null },
     },
     {
       argv: ["busybox", "sh", "-lc", "echo hi"],
       expectedInline: "echo hi",
-      expectedCommand: { isWrapper: true, command: "echo hi" },
+      expectedCommand: { isWrapper: true, command: null },
     },
     {
       argv: ["env", "--", "pwsh", "-Command", "Get-Date"],
       expectedInline: "Get-Date",
       expectedCommand: { isWrapper: true, command: "Get-Date" },
+    },
+    {
+      argv: ["pwsh", "-Command", "allowed.exe", ";", "unlisted.exe"],
+      expectedInline: "allowed.exe ; unlisted.exe",
+      expectedCommand: { isWrapper: true, command: "allowed.exe ; unlisted.exe" },
+    },
+    {
+      argv: ["cmd.exe", "-c", "echo", "hi"],
+      expectedInline: "echo hi",
+      expectedCommand: { isWrapper: true, command: "echo hi" },
+    },
+    {
+      argv: ["cmd", "-k", "echo", "hi"],
+      expectedInline: "echo hi",
+      expectedCommand: { isWrapper: true, command: "echo hi" },
+    },
+    {
+      argv: ["pwsh", "-ec", "ZQBjAGgAbwA="],
+      expectedInline: "ZQBjAGgAbwA=",
+      expectedCommand: { isWrapper: true, command: "ZQBjAGgAbwA=" },
+    },
+    {
+      argv: ["pwsh", "/NoProfile", "/ec", "ZQBjAGgAbwA="],
+      expectedInline: "ZQBjAGgAbwA=",
+      expectedCommand: { isWrapper: true, command: "ZQBjAGgAbwA=" },
+    },
+    {
+      argv: ["pwsh", "-WorkingDir", "/tmp/project", "/ec", "ZQBjAGgAbwA="],
+      expectedInline: "ZQBjAGgAbwA=",
+      expectedCommand: { isWrapper: true, command: "ZQBjAGgAbwA=" },
+    },
+    {
+      argv: ["pwsh", "-if", "XML", "-EncodedCommand", "ZQBjAGgAbwA="],
+      expectedInline: "ZQBjAGgAbwA=",
+      expectedCommand: { isWrapper: true, command: "ZQBjAGgAbwA=" },
+    },
+    {
+      argv: ["pwsh", "-config", "SomeConfig", "-ec", "ZQBjAGgAbwA="],
+      expectedInline: "ZQBjAGgAbwA=",
+      expectedCommand: { isWrapper: true, command: "ZQBjAGgAbwA=" },
+    },
+    {
+      argv: ["pwsh", "-win", "hidden", "/ec", "ZQBjAGgAbwA="],
+      expectedInline: "ZQBjAGgAbwA=",
+      expectedCommand: { isWrapper: true, command: "ZQBjAGgAbwA=" },
+    },
+    {
+      argv: ["pwsh", "-ea", "stop", "-Command", "Get-Date"],
+      expectedInline: "Get-Date",
+      expectedCommand: { isWrapper: true, command: "Get-Date" },
+    },
+    {
+      argv: ["pwsh", "-ep", "Bypass", "-Command", "Get-Date"],
+      expectedInline: "Get-Date",
+      expectedCommand: { isWrapper: true, command: "Get-Date" },
+    },
+    {
+      argv: ["pwsh", "-cus", "pipe-name", "-ec", "ZQBjAGgAbwA="],
+      expectedInline: "ZQBjAGgAbwA=",
+      expectedCommand: { isWrapper: true, command: "ZQBjAGgAbwA=" },
+    },
+    {
+      argv: ["pwsh", "-to", "token-value", "-Command", "Get-Date"],
+      expectedInline: "Get-Date",
+      expectedCommand: { isWrapper: true, command: "Get-Date" },
+    },
+    {
+      argv: ["pwsh", "-utc", "1234", "-Command", "Get-Date"],
+      expectedInline: "Get-Date",
+      expectedCommand: { isWrapper: true, command: "Get-Date" },
+    },
+    {
+      argv: ["pwsh", "-encodeda", "YQByAGcA", "-Command", "Get-Date"],
+      expectedInline: "Get-Date",
+      expectedCommand: { isWrapper: true, command: "Get-Date" },
+    },
+    {
+      argv: ["pwsh", "-en", "ZQBjAGgAbwA="],
+      expectedInline: "ZQBjAGgAbwA=",
+      expectedCommand: { isWrapper: true, command: "ZQBjAGgAbwA=" },
+    },
+    {
+      argv: ["pwsh", "-File", "script.ps1", "-ExtraArg"],
+      expectedInline: "script.ps1",
+      expectedCommand: { isWrapper: true, command: "script.ps1" },
+    },
+    {
+      argv: ["pwsh", "--commandwithargs", "allowed.exe", ";", "unlisted.exe"],
+      expectedInline: "allowed.exe ; unlisted.exe",
+      expectedCommand: { isWrapper: true, command: "allowed.exe ; unlisted.exe" },
+    },
+    {
+      argv: ["pwsh", "-CommandWithArgs", "allowed.exe", ";", "unlisted.exe"],
+      expectedInline: "allowed.exe ; unlisted.exe",
+      expectedCommand: { isWrapper: true, command: "allowed.exe ; unlisted.exe" },
+    },
+    {
+      argv: ["pwsh", "-cwa", "Write-Output", "hi"],
+      expectedInline: "Write-Output hi",
+      expectedCommand: { isWrapper: true, command: "Write-Output hi" },
+    },
+    {
+      argv: ["pwsh", "script.ps1", "-en", "VwByAGkAdABlAC0ATwB1AHQAcAB1AHQAIABoAGkA"],
+      expectedInline: null,
+      expectedCommand: { isWrapper: false, command: null },
     },
     {
       argv: ["bash", "script.sh"],
@@ -410,7 +691,7 @@ describe("extractShellWrapperCommand", () => {
   });
 
   test("prefers an explicit raw command override when provided", () => {
-    expect(extractShellWrapperCommand(["bash", "-lc", "echo hi"], "  run this instead  ")).toEqual({
+    expect(extractShellWrapperCommand(["bash", "-c", "echo hi"], "  run this instead  ")).toEqual({
       isWrapper: true,
       command: "run this instead",
     });

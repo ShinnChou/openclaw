@@ -1,26 +1,26 @@
+/** Tests unsupported SecretRef surface policy matching and messages. */
 import { describe, expect, it } from "vitest";
-import {
-  collectUnsupportedSecretRefConfigCandidates,
-  UNSUPPORTED_SECRETREF_SURFACE_PATTERNS,
-} from "./unsupported-surface-policy.js";
+import { unsupportedSecretRefSurfacePolicy } from "./unsupported-surface-policy.js";
 
 describe("unsupported SecretRef surface policy metadata", () => {
   it("exposes the canonical unsupported surface patterns", () => {
-    expect(UNSUPPORTED_SECRETREF_SURFACE_PATTERNS).toEqual([
-      "commands.ownerDisplaySecret",
-      "hooks.token",
-      "hooks.gmail.pushToken",
-      "hooks.mappings[].sessionKey",
-      "auth-profiles.oauth.*",
-      "channels.discord.threadBindings.webhookToken",
-      "channels.discord.accounts.*.threadBindings.webhookToken",
-      "channels.whatsapp.creds.json",
-      "channels.whatsapp.accounts.*.creds.json",
-    ]);
+    expect(unsupportedSecretRefSurfacePolicy.listPatterns().toSorted()).toEqual(
+      [
+        "commands.ownerDisplaySecret",
+        "hooks.token",
+        "hooks.gmail.pushToken",
+        "hooks.mappings[].sessionKey",
+        "auth-profiles.oauth.*",
+        "channels.discord.threadBindings.webhookToken",
+        "channels.discord.accounts.*.threadBindings.webhookToken",
+        "channels.whatsapp.creds.json",
+        "channels.whatsapp.accounts.*.creds.json",
+      ].toSorted(),
+    );
   });
 
   it("discovers concrete config candidates for unsupported mutable surfaces", () => {
-    const candidates = collectUnsupportedSecretRefConfigCandidates({
+    const candidates = unsupportedSecretRefSurfacePolicy.collectConfigCandidates({
       commands: { ownerDisplaySecret: { source: "env", provider: "default", id: "OWNER" } },
       hooks: {
         token: { source: "env", provider: "default", id: "HOOK_TOKEN" },

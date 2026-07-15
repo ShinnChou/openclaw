@@ -1,17 +1,15 @@
+// Stores managed task-flow records in memory and notifies registry observers.
 import {
-  closeTaskFlowRegistrySqliteStore,
+  closeTaskFlowRegistryDatabase,
   deleteTaskFlowRegistryRecordFromSqlite,
   loadTaskFlowRegistryStateFromSqlite,
   saveTaskFlowRegistryStateToSqlite,
   upsertTaskFlowRegistryRecordToSqlite,
 } from "./task-flow-registry.store.sqlite.js";
+import type { TaskFlowRegistryStoreSnapshot } from "./task-flow-registry.store.types.js";
 import type { TaskFlowRecord } from "./task-flow-registry.types.js";
 
-export type TaskFlowRegistryStoreSnapshot = {
-  flows: Map<string, TaskFlowRecord>;
-};
-
-export type TaskFlowRegistryStore = {
+type TaskFlowRegistryStore = {
   loadSnapshot: () => TaskFlowRegistryStoreSnapshot;
   saveSnapshot: (snapshot: TaskFlowRegistryStoreSnapshot) => void;
   upsertFlow?: (flow: TaskFlowRecord) => void;
@@ -19,7 +17,7 @@ export type TaskFlowRegistryStore = {
   close?: () => void;
 };
 
-export type TaskFlowRegistryHookEvent =
+export type TaskFlowRegistryObserverEvent =
   | {
       kind: "restored";
       flows: TaskFlowRecord[];
@@ -35,9 +33,9 @@ export type TaskFlowRegistryHookEvent =
       previous: TaskFlowRecord;
     };
 
-export type TaskFlowRegistryHooks = {
-  // Hooks are incremental/observational. Snapshot persistence belongs to TaskFlowRegistryStore.
-  onEvent?: (event: TaskFlowRegistryHookEvent) => void;
+type TaskFlowRegistryObservers = {
+  // Observers are incremental/best-effort only. Snapshot persistence belongs to TaskFlowRegistryStore.
+  onEvent?: (event: TaskFlowRegistryObserverEvent) => void;
 };
 
 const defaultFlowRegistryStore: TaskFlowRegistryStore = {
@@ -45,34 +43,40 @@ const defaultFlowRegistryStore: TaskFlowRegistryStore = {
   saveSnapshot: saveTaskFlowRegistryStateToSqlite,
   upsertFlow: upsertTaskFlowRegistryRecordToSqlite,
   deleteFlow: deleteTaskFlowRegistryRecordFromSqlite,
-  close: closeTaskFlowRegistrySqliteStore,
+  close: closeTaskFlowRegistryDatabase,
 };
 
 let configuredFlowRegistryStore: TaskFlowRegistryStore = defaultFlowRegistryStore;
-let configuredFlowRegistryHooks: TaskFlowRegistryHooks | null = null;
+let configuredFlowRegistryObservers: TaskFlowRegistryObservers | null = null;
 
 export function getTaskFlowRegistryStore(): TaskFlowRegistryStore {
   return configuredFlowRegistryStore;
 }
 
-export function getTaskFlowRegistryHooks(): TaskFlowRegistryHooks | null {
-  return configuredFlowRegistryHooks;
+export function getTaskFlowRegistryObservers(): TaskFlowRegistryObservers | null {
+  return configuredFlowRegistryObservers;
 }
 
-export function configureTaskFlowRegistryRuntime(params: {
+function configureTaskFlowRegistryRuntime(params: {
   store?: TaskFlowRegistryStore;
-  hooks?: TaskFlowRegistryHooks | null;
+  observers?: TaskFlowRegistryObservers | null;
 }) {
   if (params.store) {
     configuredFlowRegistryStore = params.store;
   }
-  if ("hooks" in params) {
-    configuredFlowRegistryHooks = params.hooks ?? null;
+  if ("observers" in params) {
+    configuredFlowRegistryObservers = params.observers ?? null;
   }
 }
 
 export function resetTaskFlowRegistryRuntimeForTests() {
   configuredFlowRegistryStore.close?.();
   configuredFlowRegistryStore = defaultFlowRegistryStore;
-  configuredFlowRegistryHooks = null;
+  configuredFlowRegistryObservers = null;
+}
+
+if (process.env.VITEST || process.env.NODE_ENV === "test") {
+  (globalThis as Record<PropertyKey, unknown>)[
+    Symbol.for("openclaw.taskFlowRegistryStoreTestApi")
+  ] = { configureTaskFlowRegistryRuntime };
 }

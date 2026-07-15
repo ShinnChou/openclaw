@@ -1,11 +1,13 @@
-import type { Guild } from "@buape/carbon";
+// Discord plugin module implements access behavior.
 import { resolveCommandAuthorizedFromAuthorizers } from "openclaw/plugin-sdk/command-auth-native";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
-import type { DiscordAccountConfig } from "openclaw/plugin-sdk/config-runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import type { DiscordAccountConfig } from "openclaw/plugin-sdk/config-contracts";
 import { resolveOpenProviderRuntimeGroupPolicy } from "openclaw/plugin-sdk/runtime-group-policy";
+import type { Guild } from "../internal/discord.js";
 import {
   isDiscordGroupAllowedByPolicy,
   resolveDiscordChannelConfigWithFallback,
+  type DiscordChannelConfigResolved,
   resolveDiscordGuildEntry,
   resolveDiscordMemberAccessState,
   resolveDiscordOwnerAccess,
@@ -14,6 +16,7 @@ import {
 export async function authorizeDiscordVoiceIngress(params: {
   cfg: OpenClawConfig;
   discordConfig: DiscordAccountConfig;
+  accountId?: string;
   groupPolicy?: "open" | "disabled" | "allowlist";
   useAccessGroups?: boolean;
   guild?: Guild<true> | Guild | null;
@@ -28,8 +31,12 @@ export async function authorizeDiscordVoiceIngress(params: {
   scope?: "channel" | "thread";
   channelLabel?: string;
   memberRoleIds: string[];
+  ownerAllowFrom?: string[];
+  ownerAllowAll?: boolean;
   sender: { id: string; name?: string; tag?: string };
-}): Promise<{ ok: true } | { ok: false; message: string }> {
+}): Promise<
+  { ok: true; channelConfig?: DiscordChannelConfigResolved | null } | { ok: false; message: string }
+> {
   const groupPolicy =
     params.groupPolicy ??
     resolveOpenProviderRuntimeGroupPolicy({
@@ -71,9 +78,7 @@ export async function authorizeDiscordVoiceIngress(params: {
     };
   }
 
-  const channelAllowed = channelConfig
-    ? channelConfig.allowed !== false
-    : !channelAllowlistConfigured;
+  const channelAllowed = channelConfig ? channelConfig.allowed : !channelAllowlistConfigured;
   if (
     !isDiscordGroupAllowedByPolicy({
       groupPolicy,
@@ -98,7 +103,8 @@ export async function authorizeDiscordVoiceIngress(params: {
   });
 
   const { ownerAllowList, ownerAllowed } = resolveDiscordOwnerAccess({
-    allowFrom: params.discordConfig.allowFrom ?? params.discordConfig.dm?.allowFrom ?? [],
+    allowFrom:
+      params.ownerAllowFrom ?? params.discordConfig.allowFrom ?? params.discordConfig.dm?.allowFrom,
     sender: params.sender,
     allowNameMatching: false,
   });
@@ -106,16 +112,20 @@ export async function authorizeDiscordVoiceIngress(params: {
   const useAccessGroups = params.useAccessGroups ?? params.cfg.commands?.useAccessGroups !== false;
   const authorizers = useAccessGroups
     ? [
-        { configured: ownerAllowList != null, allowed: ownerAllowed },
+        {
+          configured: params.ownerAllowAll === true || ownerAllowList != null,
+          allowed: params.ownerAllowAll === true || ownerAllowed,
+        },
         { configured: hasAccessRestrictions, allowed: memberAllowed },
       ]
     : [{ configured: hasAccessRestrictions, allowed: memberAllowed }];
 
-  return resolveCommandAuthorizedFromAuthorizers({
+  const commandAuthorized = resolveCommandAuthorizedFromAuthorizers({
     useAccessGroups,
     authorizers,
     modeWhenAccessGroupsOff: "configured",
-  })
-    ? { ok: true }
+  });
+  return commandAuthorized
+    ? { ok: true, channelConfig }
     : { ok: false, message: "You are not authorized to use this command." };
 }

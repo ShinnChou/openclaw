@@ -1,5 +1,6 @@
+// Searchable select list tests cover filtering and selection behavior.
 import { describe, expect, it } from "vitest";
-import { stripAnsi, visibleWidth } from "../../terminal/ansi.js";
+import { stripAnsi, visibleWidth } from "../../../packages/terminal-core/src/ansi.js";
 import { SearchableSelectList, type SearchableSelectListTheme } from "./searchable-select-list.js";
 
 const mockTheme: SearchableSelectListTheme = {
@@ -60,7 +61,7 @@ describe("SearchableSelectList", () => {
   function expectNoMatchesForQuery(list: SearchableSelectList, query: string) {
     typeInput(list, query);
     const output = list.render(80);
-    expect(output.some((line) => line.includes("No matches"))).toBe(true);
+    expect(output.join("\n")).toContain("No matches");
   }
 
   function expectDescriptionVisibilityAtWidth(width: number, shouldContainDescription: boolean) {
@@ -169,8 +170,10 @@ describe("SearchableSelectList", () => {
     typeInput(list, "gpt m");
 
     const renderedLine = list.render(80).find((line) => stripAnsi(line).includes("gpt-model"));
-    expect(renderedLine).toBeDefined();
-    const highlightOpens = renderedLine ? renderedLine.split("\u001b[31m").length - 1 : 0;
+    if (!renderedLine) {
+      throw new Error("expected rendered gpt-model line");
+    }
+    const highlightOpens = renderedLine.split("\u001b[31m").length - 1;
     expect(highlightOpens).toBe(2);
   });
 
@@ -252,6 +255,16 @@ describe("SearchableSelectList", () => {
 
     const selected = list.getSelectedItem();
     expect(selected?.value).toContain("gpt");
+  });
+
+  it("treats slashes as fuzzy token separators", () => {
+    const list = new SearchableSelectList(
+      [{ value: "sonnet", label: "Claude Sonnet", description: "anthropic" }],
+      5,
+      mockTheme,
+    );
+
+    expectSelectedValueForQuery(list, "anthropic/sonnet", "sonnet");
   });
 
   it("preserves fuzzy ranking when only fuzzy matches exist", () => {

@@ -1,3 +1,4 @@
+// Implements task-list commands that route through the current session agent.
 import { resolveSessionAgentId } from "../../agents/agent-scope.js";
 import { logVerbose } from "../../globals.js";
 import { formatDurationCompact } from "../../infra/format-time/format-duration.ts";
@@ -7,7 +8,11 @@ import {
   listTasksForAgentIdForStatus,
   listTasksForSessionKeyForStatus,
 } from "../../tasks/task-status-access.js";
-import { buildTaskStatusSnapshot } from "../../tasks/task-status.js";
+import {
+  buildTaskStatusSnapshot,
+  formatTaskStatusDetail,
+  formatTaskStatusTitle,
+} from "../../tasks/task-status.js";
 import type { ReplyPayload } from "../types.js";
 import type { CommandHandler, HandleCommandsParams } from "./commands-types.js";
 
@@ -58,18 +63,18 @@ function formatTaskTiming(task: TaskRecord): string | undefined {
 }
 
 function formatTaskDetail(task: TaskRecord): string | undefined {
-  if (task.status === "running" || task.status === "queued") {
-    return task.progressSummary?.trim();
-  }
-  return task.error?.trim() || task.terminalSummary?.trim();
+  return formatTaskStatusDetail(task);
 }
 
 function formatVisibleTask(task: TaskRecord, index: number): string {
-  const title = task.label?.trim() || task.task.trim();
+  const title = formatTaskStatusTitle(task);
   const status = task.status.replaceAll("_", " ");
   const timing = formatTaskTiming(task);
   const detail = formatTaskDetail(task);
-  const meta = [TASK_RUNTIME_LABELS[task.runtime], status, timing].filter(Boolean).join(" · ");
+  let meta = `${TASK_RUNTIME_LABELS[task.runtime]} · ${status}`;
+  if (timing) {
+    meta += ` · ${timing}`;
+  }
   const lines = [`${index + 1}. ${TASK_STATUS_ICONS[task.status]} ${title}`, `   ${meta}`];
   if (detail) {
     lines.push(`   ${detail}`);
@@ -77,7 +82,7 @@ function formatVisibleTask(task: TaskRecord, index: number): string {
   return lines.join("\n");
 }
 
-export function buildTasksText(params: { sessionKey: string; agentId: string }): string {
+function buildTasksText(params: { sessionKey: string; agentId: string }): string {
   const sessionSnapshot = buildTaskStatusSnapshot(
     listTasksForSessionKeyForStatus(params.sessionKey),
   );
@@ -106,13 +111,11 @@ export function buildTasksText(params: { sessionKey: string; agentId: string }):
   return lines.join("\n");
 }
 
-export async function buildTasksReply(params: HandleCommandsParams): Promise<ReplyPayload> {
-  const agentId =
-    params.agentId ??
-    resolveSessionAgentId({
-      sessionKey: params.sessionKey,
-      config: params.cfg,
-    });
+async function buildTasksReply(params: HandleCommandsParams): Promise<ReplyPayload> {
+  const agentId = resolveSessionAgentId({
+    sessionKey: params.sessionKey,
+    config: params.cfg,
+  });
   return {
     text: buildTasksText({
       sessionKey: params.sessionKey,
